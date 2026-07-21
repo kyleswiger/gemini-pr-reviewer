@@ -8,7 +8,7 @@ from ssm_secrets import get_gemini_api_key
 logger = logging.getLogger()
 
 GEMINI_API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-flash-latest"
 
 
 SYSTEM_PROMPT = """You are Gemini PR Reviewer, an expert AI staff software engineer and code reviewer.
