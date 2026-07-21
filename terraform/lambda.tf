@@ -92,6 +92,21 @@ resource "aws_iam_role_policy" "lambda_ssm_read" {
   policy = data.aws_iam_policy_document.lambda_ssm_read.json
 }
 
+data "aws_iam_policy_document" "lambda_self_invoke" {
+  statement {
+    sid       = "AllowSelfInvoke"
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = ["arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}"]
+  }
+}
+
+resource "aws_iam_role_policy" "lambda_self_invoke" {
+  name   = "${var.project_name}-self-invoke"
+  role   = aws_iam_role.lambda_exec.id
+  policy = data.aws_iam_policy_document.lambda_self_invoke.json
+}
+
 # -----------------------------------------------------------------------------
 # CloudWatch log group (explicit so we control retention).
 # -----------------------------------------------------------------------------
@@ -125,10 +140,19 @@ resource "aws_lambda_function" "webhook" {
     aws_cloudwatch_log_group.lambda,
     aws_iam_role_policy_attachment.lambda_basic,
     aws_iam_role_policy.lambda_ssm_read,
+    aws_iam_role_policy.lambda_self_invoke,
   ]
 }
 
 resource "aws_lambda_function_url" "webhook" {
   function_name      = aws_lambda_function.webhook.function_name
   authorization_type = "NONE" # GitHub webhooks authenticate via HMAC inside the handler.
+}
+
+resource "aws_lambda_permission" "function_url" {
+  statement_id           = "FunctionURLAllowPublicAccess"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.webhook.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
 }

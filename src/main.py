@@ -1,10 +1,4 @@
-"""GitHub webhook receiver for the Gemini PR Reviewer.
-
-Phase 1 scope: acknowledge GitHub webhook deliveries within the 3-second
-window after verifying the HMAC-SHA256 signature with a secret loaded
-from AWS SSM Parameter Store. Downstream review orchestration is added
-in Phase 2.
-"""
+"""GitHub webhook receiver for the Gemini PR Reviewer."""
 from __future__ import annotations
 
 import hashlib
@@ -14,34 +8,17 @@ import logging
 import os
 
 import boto3
-from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from mangum import Mangum
 
+from ssm_secrets import get_webhook_secret
+from reviewer import run_pr_review_pipeline
+
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
-SSM_PARAMETER_PREFIX = os.environ.get("SSM_PARAMETER_PREFIX", "/gemini-pr-reviewer")
-WEBHOOK_SECRET_PARAMETER = f"{SSM_PARAMETER_PREFIX}/webhook_secret"
-
-_ssm_client = boto3.client("ssm")
-_secret_cache: dict[str, str] = {}
-
-
-def get_secret(name: str) -> str:
-    """Fetch a SecureString parameter from SSM, cached per execution env."""
-    cached = _secret_cache.get(name)
-    if cached is not None:
-        return cached
-    try:
-        response = _ssm_client.get_parameter(Name=name, WithDecryption=True)
-    except ClientError as exc:
-        logger.exception("Failed to fetch SSM parameter %s", name)
-        raise RuntimeError(f"unable to load secret {name}") from exc
-    value = response["Parameter"]["Value"]
-    _secret_cache[name] = value
-    return value
+_lambda_client = boto3.client("lambda")
 
 
 def verify_signature(payload: bytes, signature_header: str | None, secret: str) -> bool:
@@ -53,7 +30,7 @@ def verify_signature(payload: bytes, signature_header: str | None, secret: str) 
     return hmac.compare_digest(expected, provided)
 
 
-app = FastAPI(title="Gemini PR Reviewer", version="0.1.0")
+app = FastAPI(title="Gemini PR Reviewer", version="0.2.0")
 
 
 @app.get("/healthz")
@@ -68,8 +45,24 @@ async def webhook(request: Request) -> JSONResponse:
     event = request.headers.get("X-GitHub-Event", "unknown")
     delivery = request.headers.get("X-GitHub-Delivery", "unknown")
 
+    # If payload is passed via async Lambda invocation
     try:
-        secret = get_secret(WEBHOOK_SECRET_PARAMETER)
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        logger.warning("malformed json delivery=%s", delivery)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="invalid json"
+        )
+
+    # Check if this is an internal async invocation
+    if payload.get("is_async_exec") is True:
+        logger.info("Executing async PR review pipeline delivery=%s", delivery)
+        result = await run_pr_review_pipeline(payload)
+        return JSONResponse(status_code=200, content=result)
+
+    # Validate webhook secret from SSM
+    try:
+        secret = get_webhook_secret()
     except RuntimeError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -82,22 +75,42 @@ async def webhook(request: Request) -> JSONResponse:
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid signature"
         )
 
-    try:
-        payload = json.loads(body or b"{}")
-    except json.JSONDecodeError:
-        logger.warning("malformed json delivery=%s", delivery)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="invalid json"
-        )
-
     action = payload.get("action", "n/a")
     logger.info(
         "received github event=%s action=%s delivery=%s", event, action, delivery
     )
 
-    # Phase 2 hands off here to the review pipeline (likely async via SQS
-    # or a self-invoke Lambda) so we stay under GitHub's 10s webhook timeout.
-    return JSONResponse(status_code=200, content={"received": True, "event": event})
+    # Only process pull_request events for relevant actions
+    if event == "pull_request" and action in ("opened", "synchronize", "reopened", "edited"):
+        function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        if function_name:
+            # Asynchronously invoke self to decouple review pipeline from GitHub's 10s timeout
+            payload["is_async_exec"] = True
+            logger.info("Queuing async Lambda invocation function=%s delivery=%s", function_name, delivery)
+            try:
+                _lambda_client.invoke(
+                    FunctionName=function_name,
+                    InvocationType="Event",  # Async execution
+                    Payload=json.dumps(payload),
+                )
+                return JSONResponse(
+                    status_code=200,
+                    content={"received": True, "status": "queued", "event": event, "action": action},
+                )
+            except Exception as exc:
+                logger.exception("Failed to trigger async Lambda invocation")
+                # Fallback to in-flight processing if self-invoke fails
+                result = await run_pr_review_pipeline(payload)
+                return JSONResponse(status_code=200, content=result)
+
+        # Local execution / non-Lambda fallback
+        result = await run_pr_review_pipeline(payload)
+        return JSONResponse(status_code=200, content=result)
+
+    return JSONResponse(
+        status_code=200,
+        content={"received": True, "status": "ignored", "event": event, "action": action},
+    )
 
 
 handler = Mangum(app, lifespan="off")

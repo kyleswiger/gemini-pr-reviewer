@@ -33,9 +33,9 @@ variable "lambda_architecture" {
 }
 
 variable "lambda_timeout_seconds" {
-  description = "Lambda timeout. Must stay comfortably under GitHub's 10s webhook deadline."
+  description = "Lambda timeout for PR diff processing and Gemini review generation."
   type        = number
-  default     = 10
+  default     = 60
 }
 
 variable "lambda_memory_mb" {
