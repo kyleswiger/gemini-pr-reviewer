@@ -9,7 +9,50 @@ logger = logging.getLogger()
 
 
 async def run_pr_review_pipeline(payload: dict) -> dict:
-    """Process a pull_request webhook payload and post review to GitHub."""
+    """Process a pull_request webhook payload and post review to GitHub.
+
+    Wraps the pipeline so the `gemini-pr-review` commit status always resolves.
+    The status reports whether a review *completed*, not whether Gemini liked
+    the change — the gate is "an agentic review ran against this commit".
+    """
+    repo = payload.get("repository", {}).get("full_name")
+    sha = payload.get("pull_request", {}).get("head", {}).get("sha")
+
+    try:
+        result = await _run_pr_review_pipeline(payload)
+    except Exception as exc:
+        logger.exception("PR review pipeline failed for %s@%s", repo, sha)
+        await _report_status(repo, sha, "error", f"Review failed: {type(exc).__name__}")
+        raise
+
+    if result.get("success"):
+        await _report_status(repo, sha, "success", _describe(result))
+    else:
+        await _report_status(
+            repo, sha, "error", f"Review did not run: {result.get('reason', 'unknown')}"
+        )
+    return result
+
+
+def _describe(result: dict) -> str:
+    if result.get("reason") == "empty_diff":
+        return "No reviewable changes in this pull request"
+    return "Gemini review posted"
+
+
+async def _report_status(repo: str | None, sha: str | None, state: str, description: str) -> None:
+    if not repo or not sha:
+        logger.warning("no repo/sha available; skipping %s status", state)
+        return
+    try:
+        await GitHubClient().post_commit_status(
+            repo=repo, sha=sha, state=state, description=description
+        )
+    except Exception:
+        logger.exception("Failed to report %s status for %s@%s", state, repo, sha)
+
+
+async def _run_pr_review_pipeline(payload: dict) -> dict:
     pr_data = payload.get("pull_request", {})
     repo_data = payload.get("repository", {})
 
