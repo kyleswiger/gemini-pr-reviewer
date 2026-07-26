@@ -31,7 +31,9 @@ jobs:
           # --comment is required. Without it the plugin prints the review to the
           # runner's stdout and explicitly stops before posting anything.
           prompt: '/code-review:code-review --comment https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*)"
+          # Deliberately no `claude_args: --allowedTools`. That flag REPLACES the
+          # default allowlist rather than extending it, which denied Task/Read/
+          # Grep/Glob/TodoWrite and broke the plugin's parallel review agents.
+          # The plugin's own command frontmatter declares the tools it needs.
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
