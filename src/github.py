@@ -8,6 +8,10 @@ from ssm_secrets import get_github_token
 logger = logging.getLogger()
 GITHUB_API_BASE = "https://api.github.com"
 
+# The status context branch rulesets require. Changing this string orphans the
+# required check in every ruleset that names it.
+COMMIT_STATUS_CONTEXT = "gemini-pr-review"
+
 
 class GitHubClient:
     def __init__(self, token: str | None = None) -> None:
@@ -34,6 +38,43 @@ class GitHubClient:
             resp = await client.get(url, headers=self.headers)
             resp.raise_for_status()
             return resp.json()
+
+    async def post_commit_status(
+        self,
+        repo: str,
+        sha: str,
+        state: str,
+        description: str,
+        context: str = COMMIT_STATUS_CONTEXT,
+        target_url: str | None = None,
+    ) -> dict | None:
+        """Set a commit status so branch rulesets can require the review.
+
+        Failures here are logged and swallowed: a status we cannot write must
+        never abort the review itself. The consequence is a check stuck on
+        `pending`, which fails closed against the ruleset.
+        """
+        url = f"{GITHUB_API_BASE}/repos/{repo}/statuses/{sha}"
+        payload = {
+            "state": state,
+            "context": context,
+            # GitHub truncates past 140 chars and rejects nothing, so trim here.
+            "description": description[:140],
+        }
+        if target_url:
+            payload["target_url"] = target_url
+
+        logger.info("Setting commit status %s=%s on %s@%s", context, state, repo, sha)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, headers=self.headers, json=payload)
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.HTTPError:
+            logger.exception(
+                "Failed to set commit status %s=%s on %s@%s", context, state, repo, sha
+            )
+            return None
 
     async def post_pr_review(
         self,
