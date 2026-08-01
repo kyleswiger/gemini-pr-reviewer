@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from mangum import Mangum
 
+from github import GitHubClient
 from ssm_secrets import get_webhook_secret
 from reviewer import run_pr_review_pipeline
 
@@ -28,6 +29,26 @@ def verify_signature(payload: bytes, signature_header: str | None, secret: str) 
     provided = signature_header.split("=", 1)[1]
     expected = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, provided)
+
+
+async def _set_pending_status(payload: dict, delivery: str) -> None:
+    """Flip the head commit's gemini-pr-review status to pending."""
+    repo = payload.get("repository", {}).get("full_name")
+    sha = payload.get("pull_request", {}).get("head", {}).get("sha")
+    if not repo or not sha:
+        logger.warning("no repo/sha for pending status delivery=%s", delivery)
+        return
+    try:
+        await GitHubClient().post_commit_status(
+            repo=repo,
+            sha=sha,
+            state="pending",
+            description="Gemini is reviewing this pull request…",
+        )
+    except Exception:
+        # Includes RuntimeError from an unavailable GitHub token. Never let a
+        # status write stop us from acknowledging the webhook.
+        logger.exception("Failed to set pending status delivery=%s", delivery)
 
 
 app = FastAPI(title="Gemini PR Reviewer", version="0.2.0")
@@ -82,6 +103,11 @@ async def webhook(request: Request) -> JSONResponse:
 
     # Only process pull_request events for relevant actions
     if event == "pull_request" and action in ("opened", "synchronize", "reopened", "edited"):
+        # Mark the head commit pending before any work starts. A ruleset that
+        # requires `gemini-pr-review` then blocks the merge from this moment
+        # until the pipeline reports back — including if the pipeline dies.
+        await _set_pending_status(payload, delivery)
+
         function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
         if function_name:
             # Asynchronously invoke self to decouple review pipeline from GitHub's 10s timeout
