@@ -1,6 +1,7 @@
 """GitHub webhook receiver for the Gemini PR Reviewer."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -112,6 +113,7 @@ async def webhook(request: Request) -> JSONResponse:
         if function_name:
             # Asynchronously invoke self to decouple review pipeline from GitHub's 10s timeout
             payload["is_async_exec"] = True
+            payload["delivery"] = delivery
             logger.info("Queuing async Lambda invocation function=%s delivery=%s", function_name, delivery)
             try:
                 _lambda_client.invoke(
@@ -139,4 +141,20 @@ async def webhook(request: Request) -> JSONResponse:
     )
 
 
-handler = Mangum(app, lifespan="off")
+_mangum = Mangum(app, lifespan="off")
+
+
+def handler(event, context):
+    """Lambda entrypoint.
+
+    Two event shapes arrive here: API Gateway HTTP events (the webhook), and
+    our own async self-invocations, which carry the raw GitHub payload plus
+    is_async_exec. Mangum can only route the former — handing it the async
+    payload raises "unable to infer a handler" and the review silently never
+    runs — so the async shape is dispatched to the pipeline directly.
+    """
+    if isinstance(event, dict) and event.get("is_async_exec") is True:
+        delivery = event.get("delivery", "unknown")
+        logger.info("Executing async PR review pipeline delivery=%s", delivery)
+        return asyncio.run(run_pr_review_pipeline(event))
+    return _mangum(event, context)
