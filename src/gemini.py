@@ -63,7 +63,9 @@ class GeminiClient:
         diff_content: str,
     ) -> str:
         """Call Gemini API to generate a code review for a PR diff."""
-        url = GEMINI_API_ENDPOINT.format(model=self.model) + f"?key={self.api_key}"
+        # The key travels in a header, never the URL: httpx logs every request
+        # URL at INFO, so a ?key= query string ends up in CloudWatch verbatim.
+        url = GEMINI_API_ENDPOINT.format(model=self.model)
 
         # Truncate diff if extremely large to fit token context comfortably
         max_diff_len = 80_000
@@ -103,7 +105,9 @@ class GeminiClient:
 
         logger.info("Calling Gemini API (%s) for PR analysis...", self.model)
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(
+                url, json=payload, headers={"x-goog-api-key": self.api_key}
+            )
             if resp.status_code != 200:
                 logger.error("Gemini API error %d: %s", resp.status_code, resp.text)
                 resp.raise_for_status()
