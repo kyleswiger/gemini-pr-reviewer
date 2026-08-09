@@ -1,6 +1,7 @@
 """Gemini API client for PR code analysis and review generation."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import httpx
 from ssm_secrets import get_gemini_api_key
@@ -105,12 +106,29 @@ class GeminiClient:
 
         logger.info("Calling Gemini API (%s) for PR analysis...", self.model)
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                url, json=payload, headers={"x-goog-api-key": self.api_key}
-            )
-            if resp.status_code != 200:
-                logger.error("Gemini API error %d: %s", resp.status_code, resp.text)
-                resp.raise_for_status()
+            # 429/5xx are routine for generativelanguage.googleapis.com under
+            # load (observed: 503 UNAVAILABLE failing a review outright, which
+            # left a required gemini-pr-review check stuck red on a transient).
+            # Anything else 4xx is a real request problem — no retry.
+            attempts = 4
+            for attempt in range(1, attempts + 1):
+                resp = await client.post(
+                    url, json=payload, headers={"x-goog-api-key": self.api_key}
+                )
+                if resp.status_code == 200:
+                    break
+                retryable = resp.status_code == 429 or resp.status_code >= 500
+                logger.error(
+                    "Gemini API error %d (attempt %d/%d%s): %s",
+                    resp.status_code,
+                    attempt,
+                    attempts,
+                    "" if retryable and attempt < attempts else ", giving up",
+                    resp.text[:500],
+                )
+                if not retryable or attempt == attempts:
+                    resp.raise_for_status()
+                await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s
 
             data = resp.json()
             try:
