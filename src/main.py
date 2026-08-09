@@ -143,6 +143,15 @@ async def webhook(request: Request) -> JSONResponse:
 
 _mangum = Mangum(app, lifespan="off")
 
+# One loop for the container's lifetime, NOT asyncio.run: run() closes its
+# loop and clears the thread's current loop on exit, so the next *webhook*
+# request served by the same warm container dies inside Mangum's own
+# asyncio.get_event_loop() with "There is no current event loop" — a 500 to
+# GitHub and a dropped delivery. A persistent loop keeps both entry paths
+# happy for the life of the sandbox.
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
 
 def handler(event, context):
     """Lambda entrypoint.
@@ -156,5 +165,5 @@ def handler(event, context):
     if isinstance(event, dict) and event.get("is_async_exec") is True:
         delivery = event.get("delivery", "unknown")
         logger.info("Executing async PR review pipeline delivery=%s", delivery)
-        return asyncio.run(run_pr_review_pipeline(event))
+        return _loop.run_until_complete(run_pr_review_pipeline(event))
     return _mangum(event, context)
