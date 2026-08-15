@@ -1,0 +1,48 @@
+# Matches every other repo in the set: weekly, grouped, conventional-commit
+# prefixed. Also covers pip, which nothing was watching — the Lambda's httpx and
+# google-genai pins are what talk to the Gemini API.
+version: 2
+updates:
+  # Covers `uses:` in .github/workflows. `/` is correct: the ecosystem always
+  # looks under .github/workflows, not the directory given.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # CLAUDE.md requires conventional commits; Dependabot's default subject
+    # ("Bump x from a to b") is not one.
+    commit-message:
+      prefix: chore
+    # One PR per week rather than one per action — these move together, and
+    # each PR costs a full CI run plus two agentic reviews.
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # terraform/ is the only root.
+  - package-ecosystem: terraform
+    directory: /terraform
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      terraform-modules:
+        patterns: ["*"]
+    ignore:
+      # A provider major is a migration, not a bump — Dependabot rewrites the
+      # lockfile without touching the version constraint, and `terraform init`
+      # then fails outright. Patch and minor still flow.
+      - dependency-name: hashicorp/aws
+        update-types: ["version-update:semver-major"]
+
+  # The Lambda's runtime dependencies, installed by pip at apply time.
+  - package-ecosystem: pip
+    directory: /src
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      python:
+        patterns: ["*"]
