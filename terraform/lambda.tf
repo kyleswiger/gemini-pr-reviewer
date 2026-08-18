@@ -131,8 +131,10 @@ resource "aws_lambda_function" "webhook" {
 
   environment {
     variables = {
-      SSM_PARAMETER_PREFIX = var.ssm_parameter_prefix
-      LOG_LEVEL            = "INFO"
+      SSM_PARAMETER_PREFIX   = var.ssm_parameter_prefix
+      LOG_LEVEL              = "INFO"
+      GEMINI_MODEL           = var.gemini_model
+      GEMINI_FALLBACK_MODELS = join(",", var.gemini_fallback_models)
     }
   }
 

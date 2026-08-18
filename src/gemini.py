@@ -3,13 +3,106 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import httpx
 from ssm_secrets import get_gemini_api_key
 
 logger = logging.getLogger()
 
 GEMINI_API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-DEFAULT_MODEL = "gemini-flash-latest"
+
+# Pinned id, never a `-latest` alias. Free-tier quota is metered *per model*,
+# so the id we send is the quota bucket. `gemini-flash-latest` silently
+# re-pointed to gemini-3.6-flash, whose free tier is 20 requests/**day**, and
+# every review after the 20th of the day failed the required check outright.
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+
+# Tried in order once the primary model's quota is spent. Each id is its own
+# free-tier bucket, so exhausting one still leaves a review path open.
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+    ).split(",")
+    if m.strip()
+]
+
+# Total wall-clock we will spend sleeping between retries. Must stay well
+# under the Lambda timeout — see the timeout invariant in CLAUDE.md.
+RETRY_BUDGET_SECONDS = float(os.environ.get("GEMINI_RETRY_BUDGET_SECONDS", "45"))
+REQUEST_TIMEOUT_SECONDS = 45.0
+MAX_ATTEMPTS_PER_MODEL = 4
+
+_DURATION_RE = re.compile(r"^([0-9.]+)s$")
+
+
+class GeminiQuotaExhausted(RuntimeError):
+    """Every candidate model answered 429 RESOURCE_EXHAUSTED.
+
+    Carries `status_description` so the commit status says *why* instead of
+    the useless `Review failed: HTTPStatusError`.
+    """
+
+    def __init__(self, failures: list[_ModelQuotaExhausted]) -> None:
+        self.failures = failures
+        models = ", ".join(f.model for f in failures) or "none"
+        waits = [f.retry_after for f in failures if f.retry_after]
+        hint = f"; retry in ~{int(min(waits))}s" if waits else ""
+        self.status_description = f"Gemini quota exhausted ({models}){hint}"
+        super().__init__(self.status_description)
+
+
+class _ModelQuotaExhausted(Exception):
+    """One model is out of quota; the caller may try the next one."""
+
+    def __init__(self, model: str, retry_after: float | None, daily: bool) -> None:
+        self.model = model
+        self.retry_after = retry_after
+        self.daily = daily
+        super().__init__(f"{model} quota exhausted (daily={daily})")
+
+
+def _error_details(body: dict) -> list[dict]:
+    return body.get("error", {}).get("details") or []
+
+
+def _retry_delay(body: dict) -> float | None:
+    """Google's own RetryInfo hint, in seconds.
+
+    Blind exponential backoff is useless against this API: it answers a
+    per-minute 429 with `retryDelay: 32s` while 2s/4s/8s never clears the
+    window, so all four attempts burn quota and fail together.
+    """
+    for detail in _error_details(body):
+        if str(detail.get("@type", "")).endswith("RetryInfo"):
+            match = _DURATION_RE.match(str(detail.get("retryDelay", "")))
+            if match:
+                return float(match.group(1))
+    return None
+
+
+def _quota_ids(body: dict) -> list[str]:
+    ids = []
+    for detail in _error_details(body):
+        if str(detail.get("@type", "")).endswith("QuotaFailure"):
+            for violation in detail.get("violations") or []:
+                ids.append(str(violation.get("quotaId", "")))
+    return ids
+
+
+def _is_daily_quota(body: dict) -> bool:
+    """True for a per-day cap, which no amount of waiting inside one Lambda
+    invocation will clear — the only useful move is a different model."""
+    return any("PerDay" in quota_id for quota_id in _quota_ids(body))
+
+
+def _json_or_empty(resp: httpx.Response) -> dict:
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 SYSTEM_PROMPT = """You are Gemini PR Reviewer, an expert AI staff software engineer and code reviewer.
@@ -52,9 +145,15 @@ Example format:
 
 
 class GeminiClient:
-    def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = DEFAULT_MODEL,
+        fallback_models: list[str] | None = None,
+    ) -> None:
         self.api_key = api_key or get_gemini_api_key()
         self.model = model
+        self.fallback_models = FALLBACK_MODELS if fallback_models is None else fallback_models
 
     async def generate_review(
         self,
@@ -64,10 +163,6 @@ class GeminiClient:
         diff_content: str,
     ) -> str:
         """Call Gemini API to generate a code review for a PR diff."""
-        # The key travels in a header, never the URL: httpx logs every request
-        # URL at INFO, so a ?key= query string ends up in CloudWatch verbatim.
-        url = GEMINI_API_ENDPOINT.format(model=self.model)
-
         # Truncate diff if extremely large to fit token context comfortably
         max_diff_len = 80_000
         truncated_diff = diff_content[:max_diff_len]
@@ -104,36 +199,83 @@ class GeminiClient:
             },
         }
 
-        logger.info("Calling Gemini API (%s) for PR analysis...", self.model)
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        candidates = [self.model] + [m for m in self.fallback_models if m != self.model]
+        exhausted: list[_ModelQuotaExhausted] = []
+
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            deadline = asyncio.get_running_loop().time() + RETRY_BUDGET_SECONDS
+            for model in candidates:
+                logger.info("Calling Gemini API (%s) for PR analysis...", model)
+                try:
+                    return await self._generate(client, model, payload, deadline)
+                except _ModelQuotaExhausted as exc:
+                    exhausted.append(exc)
+                    logger.warning(
+                        "Gemini quota exhausted for %s (daily=%s, retry_after=%ss)%s",
+                        exc.model,
+                        exc.daily,
+                        exc.retry_after,
+                        "; falling back to next model" if model != candidates[-1] else "",
+                    )
+
+        raise GeminiQuotaExhausted(exhausted)
+
+    async def _generate(
+        self,
+        client: httpx.AsyncClient,
+        model: str,
+        payload: dict,
+        deadline: float,
+    ) -> str:
+        """One model's request + retry loop. Raises _ModelQuotaExhausted on 429."""
+        # The key travels in a header, never the URL: httpx logs every request
+        # URL at INFO, so a ?key= query string ends up in CloudWatch verbatim.
+        url = GEMINI_API_ENDPOINT.format(model=model)
+
+        for attempt in range(1, MAX_ATTEMPTS_PER_MODEL + 1):
+            resp = await client.post(
+                url, json=payload, headers={"x-goog-api-key": self.api_key}
+            )
+            if resp.status_code == 200:
+                return _extract_review(resp.json())
+
             # 429/5xx are routine for generativelanguage.googleapis.com under
             # load (observed: 503 UNAVAILABLE failing a review outright, which
             # left a required gemini-pr-review check stuck red on a transient).
             # Anything else 4xx is a real request problem — no retry.
-            attempts = 4
-            for attempt in range(1, attempts + 1):
-                resp = await client.post(
-                    url, json=payload, headers={"x-goog-api-key": self.api_key}
-                )
-                if resp.status_code == 200:
-                    break
-                retryable = resp.status_code == 429 or resp.status_code >= 500
-                logger.error(
-                    "Gemini API error %d (attempt %d/%d%s): %s",
-                    resp.status_code,
-                    attempt,
-                    attempts,
-                    "" if retryable and attempt < attempts else ", giving up",
-                    resp.text[:500],
-                )
-                if not retryable or attempt == attempts:
-                    resp.raise_for_status()
-                await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s
+            body = _json_or_empty(resp)
+            retryable = resp.status_code == 429 or resp.status_code >= 500
+            hinted = _retry_delay(body)
+            daily = resp.status_code == 429 and _is_daily_quota(body)
+            delay = hinted if hinted is not None else 2 ** attempt
+            remaining = deadline - asyncio.get_running_loop().time()
+            # A per-day cap cannot clear inside this invocation, and a wait we
+            # cannot afford is not a wait — either way, stop burning quota on
+            # this model and let the caller try the next one.
+            out_of_road = daily or delay > remaining or attempt == MAX_ATTEMPTS_PER_MODEL
 
-            data = resp.json()
-            try:
-                review_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return review_text
-            except (KeyError, IndexError) as exc:
-                logger.error("Failed to parse Gemini response payload: %s", data)
-                raise RuntimeError("Invalid response structure from Gemini API") from exc
+            logger.error(
+                "Gemini API error %d on %s (attempt %d/%d%s): %s",
+                resp.status_code,
+                model,
+                attempt,
+                MAX_ATTEMPTS_PER_MODEL,
+                ", giving up" if out_of_road or not retryable else f", retrying in {delay:.0f}s",
+                str(body.get("error", {}).get("message", resp.text))[:300],
+            )
+
+            if resp.status_code == 429 and (out_of_road or not retryable):
+                raise _ModelQuotaExhausted(model, hinted, daily)
+            if not retryable or out_of_road:
+                resp.raise_for_status()
+            await asyncio.sleep(delay)
+
+        raise RuntimeError("unreachable: retry loop exited without a verdict")
+
+
+def _extract_review(data: dict) -> str:
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        logger.error("Failed to parse Gemini response payload: %s", data)
+        raise RuntimeError("Invalid response structure from Gemini API") from exc

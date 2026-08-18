@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from github import GitHubClient
-from gemini import GeminiClient
+from gemini import GeminiClient, GeminiQuotaExhausted
 
 logger = logging.getLogger()
 
@@ -20,6 +20,13 @@ async def run_pr_review_pipeline(payload: dict) -> dict:
 
     try:
         result = await _run_pr_review_pipeline(payload)
+    except GeminiQuotaExhausted as exc:
+        # Deliberately NOT re-raised. Lambda retries an async invocation twice,
+        # and each retry re-runs every candidate model — against a per-day cap
+        # that is 6 more wasted requests and the same red status at the end.
+        logger.error("PR review out of Gemini quota for %s@%s: %s", repo, sha, exc)
+        await _report_status(repo, sha, "error", exc.status_description)
+        return {"success": False, "reason": "quota_exhausted"}
     except Exception as exc:
         logger.exception("PR review pipeline failed for %s@%s", repo, sha)
         await _report_status(repo, sha, "error", f"Review failed: {type(exc).__name__}")

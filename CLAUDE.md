@@ -50,7 +50,9 @@ GitHub ─webhook─▶ Lambda Function URL ─▶ Mangum ─▶ FastAPI /webhoo
 - **The Function URL is unauthenticated at the edge.** All auth is the constant-time HMAC compare in `verify_signature`. Any change that lets a request reach the pipeline before that check is a security regression.
 - **`COMMIT_STATUS_CONTEXT = "gemini-pr-review"`** (`src/github.py`) is the string branch rulesets reference. Renaming it orphans the required check everywhere it's configured.
 - **Status writes fail open, the gate fails closed.** `post_commit_status` swallows its own errors so a status write never aborts a review; the consequence is a check stuck on `pending`, which blocks the merge.
-- Lambda timeout is 60s and Gemini's client timeout is 45s — both must be raised together if larger diffs need more headroom.
+- Lambda timeout is 120s; Gemini's client timeout is 45s and its retry budget (`GEMINI_RETRY_BUDGET_SECONDS`) another 45s. The Lambda timeout must stay above the sum of the other two, or a retry that honors Google's `retryDelay` gets killed mid-sleep.
+- **Free-tier Gemini quota is metered per model id, so the model id *is* the quota bucket.** `GEMINI_MODEL` must be a pinned id, never a `-latest` alias (Terraform validates this): `gemini-flash-latest` silently re-pointed to `gemini-3.6-flash`, whose free tier is 20 requests/**day**, and every review past the 20th of a day failed the required check with `Review failed: HTTPStatusError`. `GEMINI_FALLBACK_MODELS` is tried in order once the primary's quota is spent — each id is an independent bucket.
+- A per-day 429 is not retryable, and `reviewer.py` deliberately does **not** re-raise `GeminiQuotaExhausted`: re-raising makes Lambda retry the async invocation twice, burning 2×N more requests against a cap that cannot clear before the quota resets.
 
 ### Known broken: the async self-invoke path
 
