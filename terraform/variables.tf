@@ -33,9 +33,25 @@ variable "lambda_architecture" {
 }
 
 variable "lambda_timeout_seconds" {
-  description = "Lambda timeout for PR diff processing and Gemini review generation."
+  description = "Lambda timeout for PR diff processing and Gemini review generation. Must exceed the Gemini client timeout (45s) plus GEMINI_RETRY_BUDGET_SECONDS (45s)."
   type        = number
-  default     = 60
+  default     = 120
+}
+
+variable "gemini_model" {
+  description = "Gemini model id used for reviews. Pin an explicit version — free-tier quota is metered per model, and a `-latest` alias silently moves the reviewer onto whatever bucket Google repoints it to."
+  type        = string
+  default     = "gemini-3.5-flash"
+  validation {
+    condition     = !endswith(var.gemini_model, "-latest")
+    error_message = "gemini_model must be a pinned model id, not a -latest alias."
+  }
+}
+
+variable "gemini_fallback_models" {
+  description = "Models tried, in order, once the primary model's quota is exhausted. Each is its own free-tier bucket."
+  type        = list(string)
+  default     = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 }
 
 variable "lambda_memory_mb" {
