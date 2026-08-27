@@ -1,0 +1,45 @@
+# The only repo of the set with no CI at all: until now a syntax error in
+# src/*.py or a broken .tf reached `terraform apply` — and the reviewer Lambda
+# is what reviews every other repo, so it failing is not a local problem.
+#
+# There is no test suite yet. These are the checks that can run without one.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12" # matches lambda_runtime
+
+      - name: Compile every module
+        run: python -m compileall -q src
+
+      # The Lambda package is built by pip at apply time, so an unresolvable pin
+      # only surfaces during a deploy. Resolve it here instead.
+      - name: Dependencies must resolve
+        run: pip install --dry-run -r src/requirements.txt
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.9.6"
+      - run: terraform fmt -check -recursive
+        working-directory: terraform
+      - run: terraform init -backend=false -input=false
+        working-directory: terraform
+      - run: terraform validate
+        working-directory: terraform
