@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/kyleswiger/gemini-pr-reviewer/compare/v1.0.0...v1.0.1) (2026-08-29)
+
+
+### Bug Fixes
+
+* **ci:** let claude-review run on dependabot PRs ([adc11a1](https://github.com/kyleswiger/gemini-pr-reviewer/commit/adc11a1868f2f7e94125c6274feb4d569dc19508))
+* **ci:** let claude-review run on dependabot PRs ([602925b](https://github.com/kyleswiger/gemini-pr-reviewer/commit/602925be9a0dddcd3c4f1b815b062a9298c9b128))
+
 ## 1.0.0 (2026-08-27)
 
 
