@@ -37,30 +37,82 @@ MAX_ATTEMPTS_PER_MODEL = 4
 _DURATION_RE = re.compile(r"^([0-9.]+)s$")
 
 
-class GeminiQuotaExhausted(RuntimeError):
-    """Every candidate model answered 429 RESOURCE_EXHAUSTED.
+# A new request is not started with less than this much wall-clock left
+# before the hard deadline — it could not plausibly finish, and starting it
+# only turns "no review" into "no review, later".
+MIN_REQUEST_SECONDS = 10.0
 
-    Carries `status_description` so the commit status says *why* instead of
-    the useless `Review failed: HTTPStatusError`.
+STATUS_DESCRIPTION_MAX = 140  # GitHub truncates commit status descriptions here
+
+
+class _ModelUnavailable(Exception):
+    """One model cannot serve this request; the caller may try the next one.
+
+    `kind` is "quota" (429), "unavailable" (5xx, `status` holds the code) or
+    "timeout" (transport timeout, or our own wall-clock cap on the request).
     """
 
-    def __init__(self, failures: list[_ModelQuotaExhausted]) -> None:
+    def __init__(
+        self,
+        model: str,
+        kind: str,
+        status: int | None = None,
+        retry_after: float | None = None,
+        daily: bool = False,
+    ) -> None:
+        self.model = model
+        self.kind = kind
+        self.status = status
+        self.retry_after = retry_after
+        self.daily = daily
+        super().__init__(f"{model} {self.label}")
+
+    @property
+    def label(self) -> str:
+        if self.kind == "quota":
+            return "quota"
+        if self.kind == "timeout":
+            return "timeout"
+        return str(self.status)
+
+
+class GeminiUnavailable(RuntimeError):
+    """Every candidate model failed with a fall-through error (429/5xx/timeout).
+
+    Carries `status_description` so the commit status says *why* — the failure
+    kind and the models — instead of the useless `Review failed: <ExcClass>`.
+    """
+
+    def __init__(self, failures: list[_ModelUnavailable], skipped: list[str] | None = None) -> None:
         self.failures = failures
-        models = ", ".join(f.model for f in failures) or "none"
-        waits = [f.retry_after for f in failures if f.retry_after]
-        hint = f"; retry in ~{int(min(waits))}s" if waits else ""
-        self.status_description = f"Gemini quota exhausted ({models}){hint}"
+        self.skipped = skipped or []
+        self.status_description = _describe_failures(failures, self.skipped)
         super().__init__(self.status_description)
 
 
-class _ModelQuotaExhausted(Exception):
-    """One model is out of quota; the caller may try the next one."""
+class GeminiQuotaExhausted(GeminiUnavailable):
+    """Every candidate model answered 429 RESOURCE_EXHAUSTED."""
 
-    def __init__(self, model: str, retry_after: float | None, daily: bool) -> None:
-        self.model = model
-        self.retry_after = retry_after
-        self.daily = daily
-        super().__init__(f"{model} quota exhausted (daily={daily})")
+
+def _describe_failures(failures: list[_ModelUnavailable], skipped: list[str]) -> str:
+    models = ", ".join(f.model for f in failures) or "none"
+    kinds = {f.kind for f in failures}
+    if kinds == {"quota"}:
+        waits = [f.retry_after for f in failures if f.retry_after]
+        hint = f"; retry in ~{int(min(waits))}s" if waits else ""
+        text = f"Gemini quota exhausted ({models}){hint}"
+    elif kinds == {"unavailable"}:
+        codes = "/".join(dict.fromkeys(str(f.status) for f in failures))
+        text = f"Gemini unavailable ({codes}) on {models}"
+    elif kinds == {"timeout"}:
+        text = f"Gemini timed out on {models}"
+    else:
+        text = "Gemini failed: " + ", ".join(f"{f.model} {f.label}" for f in failures)
+    if skipped:
+        text += f"; no time left for {', '.join(skipped)}"
+    if len(text) > STATUS_DESCRIPTION_MAX:
+        text = text[: STATUS_DESCRIPTION_MAX - 1] + "\u2026"
+    return text
 
 
 def _error_details(body: dict) -> list[dict]:
@@ -150,10 +202,12 @@ class GeminiClient:
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
         fallback_models: list[str] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.api_key = api_key or get_gemini_api_key()
         self.model = model
         self.fallback_models = FALLBACK_MODELS if fallback_models is None else fallback_models
+        self._transport = transport  # tests inject httpx.MockTransport here
 
     async def generate_review(
         self,
@@ -200,25 +254,46 @@ class GeminiClient:
         }
 
         candidates = [self.model] + [m for m in self.fallback_models if m != self.model]
-        exhausted: list[_ModelQuotaExhausted] = []
+        failures: list[_ModelUnavailable] = []
+        skipped: list[str] = []
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            deadline = asyncio.get_running_loop().time() + RETRY_BUDGET_SECONDS
-            for model in candidates:
+        loop = asyncio.get_running_loop()
+        # Timeout invariant (CLAUDE.md): Lambda timeout > client timeout + retry
+        # budget. `deadline` bounds retry sleeps, as before; `hard_deadline`
+        # bounds every request, so all Gemini work — across every candidate —
+        # ends within RETRY_BUDGET_SECONDS + REQUEST_TIMEOUT_SECONDS.
+        deadline = loop.time() + RETRY_BUDGET_SECONDS
+        hard_deadline = deadline + REQUEST_TIMEOUT_SECONDS
+
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS, transport=self._transport
+        ) as client:
+            for i, model in enumerate(candidates):
+                if hard_deadline - loop.time() < MIN_REQUEST_SECONDS:
+                    skipped = candidates[i:]
+                    logger.warning(
+                        "Gemini time budget spent; not trying %s", ", ".join(skipped)
+                    )
+                    break
                 logger.info("Calling Gemini API (%s) for PR analysis...", model)
                 try:
-                    return await self._generate(client, model, payload, deadline)
-                except _ModelQuotaExhausted as exc:
-                    exhausted.append(exc)
+                    return await self._generate(
+                        client, model, payload, deadline, hard_deadline
+                    )
+                except _ModelUnavailable as exc:
+                    failures.append(exc)
                     logger.warning(
-                        "Gemini quota exhausted for %s (daily=%s, retry_after=%ss)%s",
+                        "Gemini %s unavailable (%s, daily=%s, retry_after=%ss)%s",
                         exc.model,
+                        exc.label,
                         exc.daily,
                         exc.retry_after,
                         "; falling back to next model" if model != candidates[-1] else "",
                     )
 
-        raise GeminiQuotaExhausted(exhausted)
+        if failures and all(f.kind == "quota" for f in failures):
+            raise GeminiQuotaExhausted(failures, skipped)
+        raise GeminiUnavailable(failures, skipped)
 
     async def _generate(
         self,
@@ -226,16 +301,39 @@ class GeminiClient:
         model: str,
         payload: dict,
         deadline: float,
+        hard_deadline: float,
     ) -> str:
-        """One model's request + retry loop. Raises _ModelQuotaExhausted on 429."""
+        """One model's request + retry loop.
+
+        Raises _ModelUnavailable on 429, on 5xx once retries run out, and on
+        any timeout — each means "this model can't serve us now, try the next".
+        """
         # The key travels in a header, never the URL: httpx logs every request
         # URL at INFO, so a ?key= query string ends up in CloudWatch verbatim.
         url = GEMINI_API_ENDPOINT.format(model=model)
 
+        loop = asyncio.get_running_loop()
         for attempt in range(1, MAX_ATTEMPTS_PER_MODEL + 1):
-            resp = await client.post(
-                url, json=payload, headers={"x-goog-api-key": self.api_key}
-            )
+            # httpx's timeout is per phase (connect, each read), not per request,
+            # so a slow trickle could outlive it; cap the whole request here.
+            cap = min(REQUEST_TIMEOUT_SECONDS, hard_deadline - loop.time())
+            try:
+                resp = await asyncio.wait_for(
+                    client.post(url, json=payload, headers={"x-goog-api-key": self.api_key}),
+                    timeout=cap,
+                )
+            except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
+                # A timeout already spent up to a full request budget; retrying
+                # the same model would spend another. Move on.
+                logger.error(
+                    "Gemini %s timed out after <=%.1fs (attempt %d/%d): %s",
+                    model,
+                    cap,
+                    attempt,
+                    MAX_ATTEMPTS_PER_MODEL,
+                    type(exc).__name__,
+                )
+                raise _ModelUnavailable(model, "timeout") from exc
             if resp.status_code == 200:
                 return _extract_review(resp.json())
 
@@ -264,9 +362,11 @@ class GeminiClient:
                 str(body.get("error", {}).get("message", resp.text))[:300],
             )
 
-            if resp.status_code == 429 and (out_of_road or not retryable):
-                raise _ModelQuotaExhausted(model, hinted, daily)
-            if not retryable or out_of_road:
+            if resp.status_code == 429 and out_of_road:
+                raise _ModelUnavailable(model, "quota", 429, hinted, daily)
+            if resp.status_code >= 500 and out_of_road:
+                raise _ModelUnavailable(model, "unavailable", resp.status_code, hinted)
+            if not retryable:
                 resp.raise_for_status()
             await asyncio.sleep(delay)
 
