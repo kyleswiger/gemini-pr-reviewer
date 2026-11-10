@@ -2,7 +2,7 @@
 # src/*.py or a broken .tf reached `terraform apply` — and the reviewer Lambda
 # is what reviews every other repo, so it failing is not a local problem.
 #
-# There is no test suite yet. These are the checks that can run without one.
+# Tests are stdlib unittest (tests/), so they need only src/requirements.txt.
 name: ci
 
 on:
@@ -29,6 +29,11 @@ jobs:
       # only surfaces during a deploy. Resolve it here instead.
       - name: Dependencies must resolve
         run: pip install --dry-run -r src/requirements.txt
+
+      - name: Unit tests
+        run: |
+          pip install -r src/requirements.txt
+          python -m unittest discover -s tests -v
 
   terraform:
     runs-on: ubuntu-latest

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from github import GitHubClient
-from gemini import GeminiClient, GeminiQuotaExhausted
+from gemini import GeminiClient, GeminiQuotaExhausted, GeminiUnavailable
 
 logger = logging.getLogger()
 
@@ -27,6 +27,14 @@ async def run_pr_review_pipeline(payload: dict) -> dict:
         logger.error("PR review out of Gemini quota for %s@%s: %s", repo, sha, exc)
         await _report_status(repo, sha, "error", exc.status_description)
         return {"success": False, "reason": "quota_exhausted"}
+    except GeminiUnavailable as exc:
+        # Every candidate answered 5xx or timed out. Also not re-raised: the
+        # attempt already spent up to RETRY_BUDGET + REQUEST_TIMEOUT seconds,
+        # and two Lambda retries of that would just triple the bill. Push a
+        # new commit (or redeliver the webhook) to try again.
+        logger.error("PR review: Gemini unavailable for %s@%s: %s", repo, sha, exc)
+        await _report_status(repo, sha, "error", exc.status_description)
+        return {"success": False, "reason": "gemini_unavailable"}
     except Exception as exc:
         logger.exception("PR review pipeline failed for %s@%s", repo, sha)
         await _report_status(repo, sha, "error", f"Review failed: {type(exc).__name__}")
