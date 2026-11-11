@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/kyleswiger/gemini-pr-reviewer/compare/v1.0.1...v1.0.2) (2026-11-10)
+
+
+### Bug Fixes
+
+* **gemini:** fall back on 503/500/timeouts, not just 429 ([#18](https://github.com/kyleswiger/gemini-pr-reviewer/issues/18)) ([16522f9](https://github.com/kyleswiger/gemini-pr-reviewer/commit/16522f96a19251a3f127202ca543411000eefcbf))
+
 ## [1.0.1](https://github.com/kyleswiger/gemini-pr-reviewer/compare/v1.0.0...v1.0.1) (2026-08-29)
 
 
